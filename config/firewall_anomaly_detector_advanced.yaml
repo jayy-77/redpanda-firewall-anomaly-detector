@@ -1,0 +1,56 @@
+input:
+  redis_list:
+    address: "redis-cluster:6379"
+    key: "firewall_logs"
+    timeout: "10s"
+    tls:
+      enabled: true
+      skip_cert_verify: false
+
+pipeline:
+  threads: 4
+  processors:
+  - firewall_anomaly_detector:
+      window_seconds: 300  # 5 minutes for more stable patterns
+      model_path: "/models/isolation_forest_v2.pkl"
+      score_threshold: 0.85  # Higher threshold for production
+      redis_config:
+        address: "redis-cluster:6379"
+        password: "${REDIS_PASSWORD}"
+        db: 1
+        key: "firewall_logs"
+      kafka_config:
+        brokers: 
+          - "kafka1:9092"
+          - "kafka2:9092"
+          - "kafka3:9092"
+        anomaly_topic: "security-anomalies"
+        normal_topic: "security-normal"
+      sources:
+        fortinet.firewall:
+          metric: "connection_count"
+        paloalto.firewall:
+          metric: "bytes_sent"
+        checkpoint.firewall:
+          metric: "bytes_recv"
+        cisco.asa:
+          metric: "connection_count"
+        juniper.srx:
+          metric: "bytes_sent"
+        sophos.firewall:
+          metric: "connection_count"
+
+output:
+  kafka:
+    addresses: 
+      - "kafka1:9092"
+      - "kafka2:9092"
+      - "kafka3:9092"
+    topic: "${! meta(\"topic\")}"
+    key: "${! json(\"log_source\")}"
+    compression: "snappy"
+    max_message_bytes: 1048576
+    timeout: "30s"
+    tls:
+      enabled: true
+      skip_cert_verify: false 
