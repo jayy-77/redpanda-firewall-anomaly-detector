@@ -3,13 +3,15 @@ package processor
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/redpanda-data/benthos/v4/public/service"
 	"gonum.org/v1/gonum/stat"
+
+	"github.com/jaykumar/redpanda-firewall-anomaly-detector/processor/drift"
+	"github.com/jaykumar/redpanda-firewall-anomaly-detector/processor/ml"
 )
 
 func init() {
@@ -76,7 +78,32 @@ Features:
 				"paloalto.firewall": map[string]interface{}{
 					"metric": "bytes_sent",
 				},
-			}))
+			})).
+		Field(service.NewObjectField("scorer",
+			service.NewStringField("type").
+				Description("Scorer impl: heuristic | http | onnx").
+				Default("heuristic"),
+			service.NewStringField("http_url").
+				Description("URL of the HTTP model server (used when type=http)").
+				Default("http://model-server:8000/score"),
+			service.NewIntField("http_timeout_ms").
+				Description("HTTP scorer timeout in ms").
+				Default(2000),
+			service.NewBoolField("fallback_to_heuristic").
+				Description("If the configured scorer fails to load, use heuristic instead").
+				Default(true),
+		)).
+		Field(service.NewObjectField("drift",
+			service.NewBoolField("enabled").
+				Description("Whether to compute per-feature drift online").
+				Default(true),
+			service.NewIntField("reservoir_size").
+				Description("Number of samples kept in the rolling reservoir").
+				Default(1024),
+			service.NewFloatField("psi_threshold").
+				Description("PSI value above which a feature is flagged as drifted").
+				Default(0.2),
+		))
 
 	constructor := func(conf *service.ParsedConfig, mgr *service.Resources) (service.Processor, error) {
 		return newFirewallAnomalyDetector(conf, mgr)
@@ -131,10 +158,15 @@ type FirewallAnomalyDetector struct {
 	windows      map[string]*WindowData
 	windowsMutex sync.RWMutex
 
+	scorer  ml.Scorer
+	drift   *drift.Detector
+	driftOn bool
+
 	// Metrics
 	processedLogs     *service.MetricCounter
 	anomaliesDetected *service.MetricCounter
 	windowsCreated    *service.MetricCounter
+	driftEvents       *service.MetricCounter
 }
 
 func newFirewallAnomalyDetector(conf *service.ParsedConfig, mgr *service.Resources) (*FirewallAnomalyDetector, error) {
@@ -208,6 +240,31 @@ func newFirewallAnomalyDetector(conf *service.ParsedConfig, mgr *service.Resourc
 		DB:       redisDB,
 	})
 
+	// Build the scorer per config.
+	scorerType, _ := conf.FieldString("scorer", "type")
+	httpURL, _ := conf.FieldString("scorer", "http_url")
+	httpTimeoutMs, _ := conf.FieldInt("scorer", "http_timeout_ms")
+	fallback, _ := conf.FieldBool("scorer", "fallback_to_heuristic")
+	scorer, err := ml.NewScorer(ml.FactoryConfig{
+		Type:           scorerType,
+		ModelPath:      modelPath,
+		HTTPURL:        httpURL,
+		HTTPTimeoutMs:  httpTimeoutMs,
+		FeatureOrder:   []string{"mean_value", "std_dev", "max_value", "min_value", "percent_change", "unique_ips", "peak_to_mean_ratio"},
+		FallbackToHeur: fallback,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	driftOn, _ := conf.FieldBool("drift", "enabled")
+	reservoirSize, _ := conf.FieldInt("drift", "reservoir_size")
+	psiThreshold, _ := conf.FieldFloat("drift", "psi_threshold")
+	driftDet := drift.NewDetector(drift.Config{
+		ReservoirCapacity: reservoirSize,
+		PSIThreshold:      psiThreshold,
+	})
+
 	detector := &FirewallAnomalyDetector{
 		logger:            mgr.Logger(),
 		metrics:           mgr.Metrics(),
@@ -221,14 +278,16 @@ func newFirewallAnomalyDetector(conf *service.ParsedConfig, mgr *service.Resourc
 		normalTopic:       normalTopic,
 		sources:           sources,
 		windows:           make(map[string]*WindowData),
+		scorer:            scorer,
+		drift:             driftDet,
+		driftOn:           driftOn,
 		processedLogs:     mgr.Metrics().NewCounter("processed_logs"),
 		anomaliesDetected: mgr.Metrics().NewCounter("anomalies_detected"),
 		windowsCreated:    mgr.Metrics().NewCounter("windows_created"),
+		driftEvents:       mgr.Metrics().NewCounter("drift_events"),
 	}
 
-	// Load ML model (placeholder - would integrate with actual ML library)
-	detector.logger.Infof("Loading ML model from: %s", modelPath)
-
+	detector.logger.Infof("scorer=%s model_path=%s drift=%v", scorer.Name(), modelPath, driftOn)
 	return detector, nil
 }
 
@@ -315,8 +374,26 @@ func (f *FirewallAnomalyDetector) processLog(ctx context.Context, log FirewallLo
 	// Extract features
 	features := f.extractFeatures(window)
 
-	// Score with ML model
-	anomalyScore := f.scoreAnomaly(features)
+	// Update drift detector and capture per-feature PSI for the event payload.
+	var driftPSI map[string]float64
+	if f.driftOn {
+		driftPSI = make(map[string]float64, len(features))
+		for k, v := range features {
+			psi, flagged := f.drift.Update(k, v)
+			driftPSI[k] = psi
+			if flagged {
+				f.driftEvents.Incr(1)
+			}
+		}
+	}
+
+	// Score with the configured ML scorer (heuristic / HTTP / ONNX).
+	anomalyScore, scoreErr := f.scorer.Score(ctx, ml.Features(features))
+	if scoreErr != nil {
+		f.logger.Warnf("scorer %s failed: %v; defaulting to heuristic", f.scorer.Name(), scoreErr)
+		fb := ml.NewHeuristicScorer()
+		anomalyScore, _ = fb.Score(ctx, ml.Features(features))
+	}
 
 	// Determine if anomaly
 	isAnomaly := anomalyScore >= f.scoreThreshold
@@ -333,6 +410,10 @@ func (f *FirewallAnomalyDetector) processLog(ctx context.Context, log FirewallLo
 		"features":      features,
 		"metric_field":  metricField,
 		"metric_value":  metricValue,
+		"scorer":        f.scorer.Name(),
+	}
+	if f.driftOn {
+		result["drift_psi"] = driftPSI
 	}
 
 	// Set topic based on anomaly status
@@ -446,37 +527,17 @@ func (f *FirewallAnomalyDetector) extractFeatures(window *WindowData) map[string
 	}
 }
 
+// scoreAnomaly is retained as a legacy entry point for the test suite.
+// New code paths should go through f.scorer.Score.
 func (f *FirewallAnomalyDetector) scoreAnomaly(features map[string]float64) float64 {
-	// This is a placeholder implementation
-	// In a real implementation, you would load and use the actual ML model
-
-	// Simple heuristic-based scoring for demonstration
-	score := 0.0
-
-	// Higher score for high percent change
-	if math.Abs(features["percent_change"]) > 50 {
-		score += 0.3
-	}
-
-	// Higher score for high peak-to-mean ratio
-	if features["peak_to_mean_ratio"] > 3 {
-		score += 0.2
-	}
-
-	// Higher score for high standard deviation
-	if features["std_dev"] > features["mean_value"] {
-		score += 0.2
-	}
-
-	// Higher score for many unique IPs
-	if features["unique_ips"] > 100 {
-		score += 0.3
-	}
-
-	return math.Min(score, 1.0)
+	s, _ := ml.NewHeuristicScorer().Score(context.Background(), ml.Features(features))
+	return s
 }
 
 func (f *FirewallAnomalyDetector) Close(ctx context.Context) error {
+	if f.scorer != nil {
+		_ = f.scorer.Close()
+	}
 	if f.redisClient != nil {
 		return f.redisClient.Close()
 	}
