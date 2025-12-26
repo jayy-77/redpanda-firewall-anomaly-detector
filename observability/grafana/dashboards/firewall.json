@@ -1,0 +1,47 @@
+{
+  "title": "Firewall Anomaly Detector",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Logs processed",
+      "targets": [{ "expr": "rate(processed_logs[5m])" }],
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 }
+    },
+    {
+      "type": "stat",
+      "title": "Anomalies detected",
+      "targets": [{ "expr": "rate(anomalies_detected[5m])" }],
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 4 }
+    },
+    {
+      "type": "stat",
+      "title": "Drift events",
+      "targets": [{ "expr": "rate(drift_events[5m])" }],
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Score latency (model server)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(model_server_score_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(model_server_score_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Windows created (per source)",
+      "targets": [{ "expr": "rate(windows_created[5m])" }],
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 }
+    }
+  ]
+}
