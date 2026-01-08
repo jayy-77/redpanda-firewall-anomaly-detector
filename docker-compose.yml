@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.9"
 
 services:
   redis:
@@ -28,9 +28,61 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-    restart: unless-stopped 
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+
+  model-server:
+    build:
+      context: .
+      dockerfile: model_server/Dockerfile
+    container_name: model-server
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /models/firewall_anomaly.joblib
+    volumes:
+      - ./models:/models:ro
+    restart: unless-stopped
+
+  firewall-anomaly-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: firewall-anomaly-detector
+    depends_on:
+      - redis
+      - kafka
+      - model-server
+    ports:
+      - "4195:4195"
+    volumes:
+      - ./config/firewall_anomaly_detector_advanced.yaml:/connect.yaml:ro
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus-firewall
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana-firewall
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./observability/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dash.yml:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped

@@ -1,1 +1,12 @@
+.git
+.github
+*.md
+docs/
+benchmarks/
+training/
+model_server/
+observability/
+models/
+*.pkl
+*.joblib
 benthos-plugin-example
