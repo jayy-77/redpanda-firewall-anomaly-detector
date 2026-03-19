@@ -7,12 +7,17 @@
 
 A **production-ready** Redpanda Connect (Benthos) processor plugin that detects anomalies in firewall logs using machine learning and sliding time windows. Perfect for real-time security monitoring and threat detection.
 
+> **New in v0.2**: full MLE stack — pluggable scorer interface (heuristic / HTTP / ONNX), Python `model_server` (FastAPI + sklearn), training pipeline mirroring the Go feature schema, online PSI drift detector, Prometheus + Grafana observability. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## 🎯 Features
 
 ### 🔍 **Advanced Anomaly Detection**
 - **Sliding Time Windows**: Configurable time windows (default: 60 seconds) for each log source
 - **7 Statistical Features**: Mean, std dev, max, min, percent change, unique IPs, peak-to-mean ratio
-- **ML Model Integration**: Ready for Isolation Forest, One-Class SVM, LOF, and Autoencoders
+- **Pluggable Scorer**: `heuristic` (default), `http` (Python model server), or `onnx` (in-process)
+- **ML Model Integration**: Isolation Forest, One-Class SVM, LOF, and Autoencoder via `model_server`
+- **Online Drift Detection**: per-feature PSI against rolling baseline reservoir
+- **Train-Serve Symmetry**: `training/extract_features.py` reproduces the Go feature schema bit-for-bit
 - **Configurable Thresholds**: Adjustable anomaly detection sensitivity
 
 ### 🛡️ **Multi-Vendor Support**
